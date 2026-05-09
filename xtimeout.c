@@ -7,6 +7,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <signal.h>
+#include <errno.h>
 #include <sys/wait.h>
 #include <sys/select.h>
 #include <getopt.h>
@@ -18,18 +19,19 @@
 
 
 char HELP[] =
-    "Usage: xtimeout [OPTS...] [-x POPUP_MESSAGE] DURATION COMMAND..."           NL
-    ""                                                                           NL
-    "Start COMMAND, [show a popup and] kill it if still running after DURATION." NL
-    ""                                                                           NL
-    "  -V           : Dump configuration (environment variables)."               NL
-    "  -k DURATION  : Also send a KILL if running after the initial signal."     NL
-    "  -s NUMBER    : Terminate with this signal, by default SIGTERM."           NL
-    "  -n MESSAGE   : Send a notification when timed out."                       NL
-    "  -X DURATION  : Popup message timeout, by default one minute."             NL
-    ""                                                                           NL
-    "Duration format: 1w2d3h30m, 3h50m, ..."                                     NL
-    "When the program times out the exit status is 124."                         NL
+    "Usage: xtimeout [OPTS...] [-x POPUP_MESSAGE] DURATION COMMAND..."            NL
+    ""                                                                            NL
+    "Start COMMAND, [show a popup and] kill it if still running after DURATION."  NL
+    ""                                                                            NL
+    "  -V           : Dump configuration (environment variables)."                NL
+    "  -k DURATION  : Also send a KILL if running after the initial signal."      NL
+    "  -s NUMBER    : Terminate with this signal, by default SIGTERM."            NL
+    "  -n MESSAGE   : Send a notification when timed out."                        NL
+    "  -X DURATION  : Popup message timeout, by default one minute."              NL
+    ""                                                                            NL
+    "Duration format: 1w2d3h30m, 3h50m, ..."                                      NL
+    "When the program times out the exit status is 124. If the user declines the" NL
+    "kill it will ask again after DURATION."                                      NL
     ;
 
 char const *xtimeout_popup_env =
@@ -140,27 +142,24 @@ main(int _argc, char *_argv[])
 		if (popup_message) {
 			bool resp = true;
 			xtimeout_popup(popup_message, popup_duration, &resp);
+			/* The response ignored, if asking fails kill the program. */
 			if (!resp) {
 				continue;
 			}
 		}
 
-		/* Terminate the program. */
+		/* Terminate the program, and go to wait when kill not needed. */
 		kill(pid, term_signal);
 		if (!kill_duration) {
 			break;
 		}
 
 		/* Kill the program if needed. */
-		if (kill_duration) {
-			e = pipe_timeout(p[0], kill_duration);
-			if (e > 0) {
-				break;
-			}
-			kill(pid, SIGKILL);
+		e = pipe_timeout(p[0], kill_duration);
+		if (e > 0) {
 			break;
 		}
-
+		kill(pid, SIGKILL);
 		break;
 	}
 
@@ -179,7 +178,7 @@ main(int _argc, char *_argv[])
 	if (p[1] != -1) close(p[1]);
 	if (pid > 0) {
 		kill(pid, SIGKILL);
-		while (waitpid(pid, NULL, WNOHANG) == 0);
+		waitpid(pid, NULL, 0);
 	}
 	return exit_code;
 }
@@ -189,7 +188,7 @@ xtimeout_popup(char const _msg[], long _timeout, bool *_res)
 {
 	char timeout_s[64] = {0};
 	if (_timeout) {
-		sprintf(timeout_s, "%li", _timeout);
+		snprintf(timeout_s, sizeof(timeout_s)-1, "%li", _timeout);
 	}
 	setenv("__TIMEOUT", timeout_s, 1);
 	setenv("__MESSAGE", _msg, 1);
@@ -212,8 +211,9 @@ xtimeout_popup(char const _msg[], long _timeout, bool *_res)
 static int
 notify_send(char const _title[], char const _message[])
 {
-	char b[strlen(notify_send_env)+64];
-	sprintf(b, "%s xtimeout %s %s >/dev/null", notify_send_env, ENV("__TITLE"), ENV("__MESSAGE"));
+	size_t l = strlen(notify_send_env)+64;
+	char b[l];
+	snprintf(b, l-1, "%s xtimeout %s %s >/dev/null", notify_send_env, ENV("__TITLE"), ENV("__MESSAGE"));
 	setenv("__TITLE", _title, 1);
 	setenv("__MESSAGE", _message, 1);
 	int ret = system(b);
@@ -260,11 +260,19 @@ pipe_timeout(int pipe_rd, long seconds)
 {
 	fd_set         rfds;
 	struct timeval tv;
-	FD_ZERO(&rfds);
-	FD_SET(pipe_rd, &rfds);
+	#ifndef __linux__
+	#  warning POSIX does not guarantee select to update tv.
+	#endif
 	tv.tv_sec  = seconds;
 	tv.tv_usec = 0;
-	return select(pipe_rd + 1, &rfds, NULL, NULL, &tv);
+	retry:
+	FD_ZERO(&rfds);
+	FD_SET(pipe_rd, &rfds);
+	int e = select(pipe_rd + 1, &rfds, NULL, NULL, &tv);
+	if (e == -1 && errno == EINTR) {
+		goto retry;
+	}
+	return e;
 }
 
 
